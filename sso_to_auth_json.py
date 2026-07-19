@@ -130,8 +130,11 @@ def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 
     return None
 
 
-def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
-    """SSO cookie → token dict (access/refresh/expires_in)。proxy 非空时全程走代理。"""
+def sso_to_token(sso_cookie: str, proxy: str = "", log=print, max_retries: int = 4) -> dict | None:
+    """SSO cookie → token dict (access/refresh/expires_in)。proxy 非空时全程走代理。
+
+    对 device-flow 的 rate_limited 自动退避重试。
+    """
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session()
     if proxies:
@@ -148,65 +151,94 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         return None
     log("  ✅ sso 有效")
 
-    log("  🔑 Device Flow...")
-    dc = request_device_code(proxy=proxy, log=log)
-    if not dc:
-        return None
-    log(f"  📋 user_code: {dc.get('user_code')}")
+    last_err = ""
+    for attempt in range(1, max_retries + 1):
+        log(f"  🔑 Device Flow... (尝试 {attempt}/{max_retries})")
+        dc = request_device_code(proxy=proxy, log=log)
+        if not dc:
+            last_err = "device/code 失败"
+            time.sleep(min(3 * attempt, 12))
+            continue
+        log(f"  📋 user_code: {dc.get('user_code')}")
 
-    try:
-        s.get(dc["verification_uri_complete"], impersonate="chrome", timeout=15)
-        r = s.post(
-            f"{OIDC_ISSUER}/oauth2/device/verify",
-            data={"user_code": dc["user_code"]},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
+        try:
+            s.get(dc["verification_uri_complete"], impersonate="chrome", timeout=15)
+            r = s.post(
+                f"{OIDC_ISSUER}/oauth2/device/verify",
+                data={"user_code": dc["user_code"]},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=15,
+                allow_redirects=True,
+            )
+            if "rate_limited" in (r.url or "") or "rate_limited" in (r.text or "").lower():
+                wait_s = min(8 * attempt, 30)
+                log(f"  ⚠️ verify 被限流，{wait_s}s 后重试: {r.url}")
+                last_err = f"verify rate_limited: {r.url}"
+                time.sleep(wait_s)
+                continue
+            if "consent" not in r.url:
+                last_err = f"verify 失败: {r.url}"
+                log(f"  ❌ {last_err}")
+                time.sleep(min(3 * attempt, 12))
+                continue
+        except Exception as e:
+            last_err = f"verify 异常: {e}"
+            log(f"  ❌ {last_err}")
+            time.sleep(min(3 * attempt, 12))
+            continue
+
+        try:
+            r = s.post(
+                f"{OIDC_ISSUER}/oauth2/device/approve",
+                data={
+                    "user_code": dc["user_code"],
+                    "action": "allow",
+                    "principal_type": "User",
+                    "principal_id": "",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=15,
+                allow_redirects=True,
+            )
+            if "rate_limited" in (r.url or "") or "rate_limited" in (r.text or "").lower():
+                wait_s = min(8 * attempt, 30)
+                log(f"  ⚠️ approve 被限流，{wait_s}s 后重试: {r.url}")
+                last_err = f"approve rate_limited: {r.url}"
+                time.sleep(wait_s)
+                continue
+            if "done" not in r.url:
+                last_err = f"approve 失败: {r.url}"
+                log(f"  ❌ {last_err}")
+                time.sleep(min(3 * attempt, 12))
+                continue
+            log("  ✅ 授权确认")
+        except Exception as e:
+            last_err = f"approve 异常: {e}"
+            log(f"  ❌ {last_err}")
+            time.sleep(min(3 * attempt, 12))
+            continue
+
+        token = poll_token(
+            dc["device_code"],
+            dc.get("interval", 5),
+            dc.get("expires_in", 1800),
+            proxy=proxy,
+            log=log,
         )
-        if "consent" not in r.url:
-            log(f"  ❌ verify 失败: {r.url}")
-            return None
-    except Exception as e:
-        log(f"  ❌ verify 异常: {e}")
-        return None
-
-    try:
-        r = s.post(
-            f"{OIDC_ISSUER}/oauth2/device/approve",
-            data={
-                "user_code": dc["user_code"],
-                "action": "allow",
-                "principal_type": "User",
-                "principal_id": "",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
+        if not token:
+            last_err = "poll token 失败"
+            time.sleep(min(3 * attempt, 12))
+            continue
+        log(
+            f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+            + (" + refresh_token" if token.get("refresh_token") else "")
         )
-        if "done" not in r.url:
-            log(f"  ❌ approve 失败: {r.url}")
-            return None
-        log("  ✅ 授权确认")
-    except Exception as e:
-        log(f"  ❌ approve 异常: {e}")
-        return None
+        return token
 
-    token = poll_token(
-        dc["device_code"],
-        dc.get("interval", 5),
-        dc.get("expires_in", 1800),
-        proxy=proxy,
-        log=log,
-    )
-    if not token:
-        return None
-    log(
-        f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
-        + (" + refresh_token" if token.get("refresh_token") else "")
-    )
-    return token
+    log(f"  ❌ Device Flow 最终失败: {last_err or 'unknown'}")
+    return None
 
 
 def token_to_auth_entry(token: dict, email: str = "") -> tuple[str, dict]:
@@ -350,6 +382,9 @@ def upload_cpa_auth_remote(
         raise ValueError("cpa_remote_url 为空")
     if not key:
         raise ValueError("cpa_management_key 为空")
+    # 允许只填域名：cpa.example.com / cpa.example.com:8317
+    if "://" not in base:
+        base = f"https://{base}"
 
     name = cpa_auth_filename(record)
     url = f"{base}/v0/management/auth-files"

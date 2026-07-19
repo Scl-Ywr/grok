@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grok 注册机 · Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("grok-webui-theme");
+        if (t !== "light" && t !== "dark") t = "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "light");
+      }
+    })();
+  </script>
+</head>
+<body>
+  <div class="bg-glow"></div>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">G</div>
+        <div>
+          <div class="brand-title">Grok Register</div>
+          <div class="brand-sub">Control Center</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-tab="register"><span class="dot"></span>注册控制台</button>
+        <button class="nav-item" data-tab="accounts"><span class="dot"></span>账号文件 CRUD</button>
+        <button class="nav-item" data-tab="local"><span class="dot"></span>本地 Auth CRUD</button>
+        <button class="nav-item" data-tab="remote"><span class="dot"></span>远程 CPA CRUD</button>
+        <button class="nav-item" data-tab="health"><span class="dot"></span>健康检测</button>
+        <button class="nav-item" data-tab="config"><span class="dot"></span>系统配置</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="runBadge" class="pill idle">就绪</div>
+        <div id="statsBadge" class="muted">成功 0 · 失败 0</div>
+        <div id="connState" class="muted sm">日志流连接中…</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="page-head">
+        <div>
+          <h1 id="pageTitle">注册控制台</h1>
+          <p id="pageDesc" class="muted">启动批量注册、实时日志、NSFW / CPA 自动入库</p>
+        </div>
+        <div class="head-actions">
+          <button id="btnTheme" class="theme-toggle" type="button" title="切换亮/暗主题">
+            <span class="icon" id="themeIcon">☀️</span>
+            <span class="label" id="themeLabel">亮色</span>
+          </button>
+          <button id="btnRefreshAll" class="btn ghost">刷新全部</button>
+        </div>
+      </header>
+
+      <!-- 全局进度条 -->
+      <div id="globalProgress" class="progress-wrap">
+        <div class="progress-track"><div id="globalProgressFill" class="progress-fill"></div></div>
+        <div id="globalProgressText" class="progress-text">就绪</div>
+      </div>
+
+      <!-- 注册 -->
+      <section id="tab-register" class="panel active">
+        <div class="stats-row">
+          <div class="stat-card"><div class="k">目标</div><div class="v" id="stTarget">0</div></div>
+          <div class="stat-card"><div class="k">当前</div><div class="v" id="stCurrent">0</div></div>
+          <div class="stat-card ok"><div class="k">成功</div><div class="v" id="stSuccess">0</div></div>
+          <div class="stat-card fail"><div class="k">失败</div><div class="v" id="stFail">0</div></div>
+        </div>
+
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-title">任务控制</div>
+            <div class="form-row">
+              <label>注册数量</label>
+              <input id="countInput" type="number" min="1" max="200" value="1" />
+            </div>
+            <div class="form-row">
+              <label>邮箱服务商</label>
+              <select id="providerSelect">
+                <option value="yyds">YYDS</option>
+                <option value="duckmail">DuckMail</option>
+                <option value="cloudflare">Cloudflare</option>
+              </select>
+            </div>
+            <div class="checks">
+              <label class="switch"><input id="nsfwToggle" type="checkbox" /><span>开启 NSFW</span></label>
+              <label class="switch"><input id="cpaToggle" type="checkbox" /><span>自动入库 CPA</span></label>
+            </div>
+            <div class="btn-row">
+              <button id="btnStart" class="btn primary">开始注册</button>
+              <button id="btnStop" class="btn danger" disabled>停止</button>
+            </div>
+            <pre class="meta" id="taskMeta">尚未开始</pre>
+          </div>
+
+          <div class="card">
+            <div class="card-title">本次结果</div>
+            <div id="resultList" class="table-wrap empty">暂无结果</div>
+          </div>
+        </div>
+
+        <div class="card log-card">
+          <div class="card-head">
+            <div class="card-title">实时日志</div>
+            <div class="btn-row">
+              <button id="btnClearLog" class="btn ghost sm">清空</button>
+              <button id="btnBottom" class="btn ghost sm">滚到底</button>
+            </div>
+          </div>
+          <pre id="logView" class="log-view"></pre>
+        </div>
+      </section>
+
+      <!-- 账号文件 -->
+      <section id="tab-accounts" class="panel">
+        <div class="grid-side">
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">账号文件</div>
+              <div class="btn-row">
+                <button id="btnAccCreate" class="btn ghost sm">新建</button>
+                <button id="btnAccConvertAll" class="btn primary sm" title="所有 accounts_*.txt → CPA JSON">全部重新生成</button>
+                <button id="btnAccRefresh" class="btn ghost sm">刷新</button>
+              </div>
+            </div>
+            <input id="accSearch" class="search" placeholder="搜索文件名…" />
+            <div id="accountFiles" class="list"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title" id="accDetailTitle">详情</div>
+              <div class="btn-row">
+                <button id="btnAccConvertJson" class="btn primary sm" disabled title="SSO 换 token → CPA JSON">生成 CPA JSON</button>
+                <button id="btnAccAddRow" class="btn ghost sm" disabled>新增行</button>
+                <button id="btnAccSaveAll" class="btn ghost sm" disabled>保存全部</button>
+                <button id="btnAccDelFile" class="btn danger sm" disabled>删除文件</button>
+              </div>
+            </div>
+            <div id="accountDetail" class="table-wrap empty">选择左侧文件</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 本地 Auth -->
+      <section id="tab-local" class="panel">
+        <div class="grid-side">
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title">本地 xai-*.json</div>
+              <div class="btn-row">
+                <button id="btnLocalCreate" class="btn ghost sm">新建</button>
+                <button id="btnLocalUploadChecked" class="btn primary sm">上传勾选到云端</button>
+                <button id="btnLocalUploadAll" class="btn ghost sm">全部上传</button>
+                <button id="btnLocalRefresh" class="btn ghost sm">刷新</button>
+              </div>
+            </div>
+            <div class="meta" id="localAuthMeta">-</div>
+            <input id="localSearch" class="search" placeholder="搜索邮箱 / 文件名…" />
+            <div id="localAuthList" class="list"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="card-title" id="localDetailTitle">Auth 详情</div>
+              <div class="btn-row">
+                <button id="btnLocalSave" class="btn primary sm" disabled>保存</button>
+                <button id="btnLocalUploadOne" class="btn ghost sm" disabled>上传此项</button>
+                <button id="btnLocalDelete" class="btn danger sm" disabled>删除</button>
+              </div>
+            </div>
+            <textarea id="localEditor" class="code-editor" placeholder="选择左侧 auth 文件进行编辑…" disabled></textarea>
+          </div>
+        </div>
+      </section>
+
+      <!-- 远程 CPA -->
+      <section id="tab-remote" class="panel">
+        <div class="card">
+          <div class="card-head">
+            <div class="card-title">远程 CPA Auth</div>
+            <div class="btn-row">
+              <button id="btnRemoteCreate" class="btn primary sm">新建上传</button>
+              <button id="btnRemoteBatchDel" class="btn danger sm">删除勾选</button>
+              <button id="btnRemoteRefresh" class="btn ghost sm">刷新</button>
+            </div>
+          </div>
+          <div class="meta" id="remoteAuthMeta">-</div>
+          <input id="remoteSearch" class="search" placeholder="搜索远程账号…" />
+          <div id="remoteAuthList" class="table-wrap empty">加载中…</div>
+        </div>
+      </section>
+
+      <!-- 健康检测 -->
+      <section id="tab-health" class="panel">
+        <div class="stats-row">
+          <div class="stat-card ok"><div class="k">健康</div><div class="v" id="hlHealthy">0</div></div>
+          <div class="stat-card warn"><div class="k">即将过期</div><div class="v" id="hlExpiring">0</div></div>
+          <div class="stat-card fail"><div class="k">不可用</div><div class="v" id="hlBad">0</div></div>
+          <div class="stat-card"><div class="k">平均分</div><div class="v" id="hlScore">-</div></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div class="card-title">本地账号健康状态</div>
+            <div class="btn-row">
+              <label class="switch" style="margin:0"><input id="healthAutoRefresh" type="checkbox" checked /><span>自动刷新 Token</span></label>
+              <label class="switch" style="margin:0"><input id="healthDeep" type="checkbox" /><span>深度检测 (chat)</span></label>
+              <label class="switch" style="margin:0"><input id="healthSyncRemote" type="checkbox" /><span>同步远程 CPA</span></label>
+              <button id="btnHealthCheck" class="btn primary sm">全部检测</button>
+              <button id="btnHealthRefresh" class="btn ghost sm">刷新已勾选</button>
+              <button id="btnHealthRelogin" class="btn ghost sm" title="用原始 SSO 重新 device flow 换 token">批量重新登录</button>
+              <button id="btnHealthDeleteFailed" class="btn danger sm">删除失效账号</button>
+              <button id="btnSsoExport" class="btn ghost sm">导出 SSO</button>
+            </div>
+          </div>
+          <div id="healthProgress" class="progress-wrap">
+            <div class="progress-track"><div id="healthProgressFill" class="progress-fill"></div></div>
+            <div id="healthProgressText" class="progress-text">就绪</div>
+          </div>
+          <input id="healthSearch" class="search" placeholder="搜索账号…" />
+          <div id="healthList" class="table-wrap empty">点击「全部检测」开始</div>
+        </div>
+      </section>
+
+      <!-- 配置 -->
+      <section id="tab-config" class="panel">
+        <div class="card">
+          <div class="card-head">
+            <div class="card-title">系统配置</div>
+            <div class="btn-row">
+              <button id="btnReloadCfg" class="btn ghost sm">重新加载</button>
+              <button id="btnSaveCfg" class="btn primary sm">保存配置</button>
+            </div>
+          </div>
+          <div class="form-grid" id="configForm"></div>
+          <p class="hint">保存写入 <code>config.json</code>。远程地址需带 <code>https://</code>。</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Modal -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="modalTitle">编辑</h3>
+        <button id="modalClose" class="btn ghost sm">关闭</button>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+      <div class="modal-foot">
+        <button id="modalCancel" class="btn ghost">取消</button>
+        <button id="modalOk" class="btn primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

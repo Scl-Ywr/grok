@@ -21,6 +21,7 @@ import random
 import re
 import string
 import json
+import base64
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -32,7 +33,10 @@ from curl_cffi import requests
 import sso_to_auth_json as _s2cpa
 
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_FILE = os.environ.get(
+    "CONFIG_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+)
 MEMORY_CLEANUP_INTERVAL = 5
 
 UI_BG = "#242424"
@@ -66,6 +70,16 @@ DEFAULT_CONFIG = {
 }
 
 config = DEFAULT_CONFIG.copy()
+
+
+def get_accounts_dir():
+    """账号输出目录：优先 ACCOUNTS_DIR / DATA_DIR，否则脚本目录。"""
+    d = str(os.environ.get("ACCOUNTS_DIR") or os.environ.get("DATA_DIR") or "").strip()
+    if d:
+        os.makedirs(d, exist_ok=True)
+        return d
+    return os.path.dirname(os.path.abspath(__file__))
+
 _cf_domain_index = 0
 
 
@@ -347,12 +361,77 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
         _cpa_log(f"直出失败: {exc}")
 
 
+def _running_in_docker() -> bool:
+    if os.environ.get("RUNNING_IN_DOCKER") == "1":
+        return True
+    try:
+        return os.path.exists("/.dockerenv")
+    except Exception:
+        return False
+
+
 def create_browser_options():
     options = ChromiumOptions()
     options.auto_port()
-    options.set_timeouts(base=1)
-    if os.path.exists(EXTENSION_PATH):
+    # base 保持短轮询；script 拉长，NSFW 浏览器 fetch 需要 await Promise
+    options.set_timeouts(base=1, script=30)
+
+    # Docker / Linux 容器常用 Chromium 路径
+    chrome_path = str(os.environ.get("CHROME_PATH") or "").strip()
+    if not chrome_path:
+        for candidate in (
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+        ):
+            if os.path.exists(candidate):
+                chrome_path = candidate
+                break
+    if chrome_path:
+        try:
+            options.set_browser_path(chrome_path)
+        except Exception:
+            try:
+                options.set_paths(browser_path=chrome_path)
+            except Exception:
+                pass
+
+    # 容器内必须关闭沙箱，并降低共享内存占用
+    in_docker = _running_in_docker()
+    headless_env = str(os.environ.get("BROWSER_HEADLESS", "")).strip().lower()
+    use_headless = headless_env in ("1", "true", "yes", "on") or (
+        in_docker and headless_env not in ("0", "false", "no", "off")
+    )
+    extra_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--window-size=1280,900",
+        "--lang=zh-CN,zh,en-US,en",
+    ]
+    if use_headless:
+        extra_args.extend(["--headless=new", "--headless"])
+    for arg in extra_args:
+        try:
+            options.set_argument(arg)
+        except Exception:
+            pass
+
+    if os.path.exists(EXTENSION_PATH) and not use_headless:
+        # headless 下部分扩展不可用；有界面/Xvfb 时再挂 turnstile 扩展
         options.add_extension(EXTENSION_PATH)
+    # 浏览器与 NSFW HTTP 请求必须走同一出口 IP，否则 cf_clearance 会立刻失效
+    proxy = str(config.get("proxy", "") or "").strip()
+    if proxy:
+        try:
+            options.set_proxy(proxy)
+        except Exception:
+            try:
+                options.set_argument(f"--proxy-server={proxy}")
+            except Exception:
+                pass
     return options
 
 
@@ -646,6 +725,10 @@ def yyds_generate_username(length=10):
 
 
 def yyds_pick_domain(api_key=None, jwt=None):
+    # 优先使用配置的域名
+    configured = config.get("defaultDomains", "")
+    if configured:
+        return configured.split(",")[0].strip()
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
         raise Exception("YYDS 没有返回任何可用域名")
@@ -1072,6 +1155,7 @@ def is_cloudflare_block_response(res):
         text = str(res.text or "").lower()
         server = headers.get("server", "")
         content_type = headers.get("content-type", "")
+        cf_ray = headers.get("cf-ray", "")
         return (
             res.status_code in (403, 429, 503)
             and (
@@ -1079,6 +1163,9 @@ def is_cloudflare_block_response(res):
                 or "cloudflare" in text
                 or "cf-error" in text
                 or "__cf_chl" in text
+                or "just a moment" in text
+                or "attention required" in text
+                or bool(cf_ray)
                 or "text/html" in content_type
             )
         )
@@ -1086,16 +1173,336 @@ def is_cloudflare_block_response(res):
         return False
 
 
+def _cookie_domain_matches(cookie_domain, target_domain):
+    domain = str(cookie_domain or "").strip().lower().lstrip(".")
+    target = str(target_domain or "").strip().lower().lstrip(".")
+    if not domain or not target:
+        return False
+    return domain == target or target.endswith("." + domain) or domain.endswith("." + target)
+
+
+def _cookie_item_fields(item):
+    if isinstance(item, dict):
+        return {
+            "name": str(item.get("name", "")).strip(),
+            "value": str(item.get("value", "")).strip(),
+            "domain": str(item.get("domain", item.get("host", "")) or "").strip().lower(),
+            "path": str(item.get("path", "/") or "/").strip() or "/",
+        }
+    return {
+        "name": str(getattr(item, "name", "")).strip(),
+        "value": str(getattr(item, "value", "")).strip(),
+        "domain": str(getattr(item, "domain", getattr(item, "host", "")) or "").strip().lower(),
+        "path": str(getattr(item, "path", "/") or "/").strip() or "/",
+    }
+
+
+def collect_browser_cookies(domains=None, log_callback=None):
+    """从注册浏览器按域名收集 cookie（含 cf_clearance / sso）。"""
+    wanted = [str(d).strip().lower().lstrip(".") for d in (domains or []) if str(d).strip()]
+    collected = []
+    try:
+        active = refresh_active_page()
+        if active is None:
+            return []
+        cookies = active.cookies(all_domains=True, all_info=True) or []
+        for item in cookies:
+            fields = _cookie_item_fields(item)
+            if not fields["name"] or not fields["value"]:
+                continue
+            if wanted and fields["domain"]:
+                if not any(_cookie_domain_matches(fields["domain"], d) for d in wanted):
+                    continue
+            elif wanted and not fields["domain"]:
+                # domain 为空时保守保留，后续按 name 过滤
+                pass
+            collected.append(fields)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 收集浏览器 cookie 失败: {exc}")
+    return collected
+
+
+def extract_cf_clearance_map(log_callback=None):
+    """按域名提取 cf_clearance，避免把 accounts.x.ai 的 clearance 用到 grok.com。"""
+    target_domains = ("grok.com", "accounts.x.ai", "x.ai")
+    cookies = collect_browser_cookies(domains=target_domains, log_callback=log_callback)
+    clearance_map = {}
+    user_agent = ""
+    try:
+        active = refresh_active_page()
+        if active is not None:
+            ua = active.run_js("return navigator.userAgent;")
+            if ua:
+                user_agent = str(ua).strip()
+    except Exception:
+        pass
+
+    for item in cookies:
+        if item["name"] != "cf_clearance":
+            continue
+        domain = item["domain"].lstrip(".")
+        if not domain:
+            continue
+        clearance_map[domain] = item["value"]
+        # 同步写入父域/子域别名，方便后续查找
+        if domain.startswith("."):
+            clearance_map[domain.lstrip(".")] = item["value"]
+        else:
+            clearance_map["." + domain] = item["value"]
+
+    if log_callback:
+        if clearance_map:
+            domains = sorted({d.lstrip(".") for d in clearance_map.keys()})
+            log_callback(f"[Debug] 已提取 cf_clearance 域名: {', '.join(domains)}")
+        else:
+            log_callback("[Debug] 未提取到任何 cf_clearance")
+        if user_agent:
+            log_callback(f"[Debug] 浏览器 UA: {user_agent[:80]}...")
+    return clearance_map, user_agent
+
+
+def resolve_cf_clearance(clearance_map, host):
+    """只返回与目标 host 匹配的 cf_clearance，禁止跨域兜底。
+
+    注意：x.ai 的 clearance 不能用于 grok.com，否则 Cloudflare 必 403。
+    """
+    host = str(host or "").strip().lower().lstrip(".")
+    if not host or not clearance_map:
+        return ""
+    candidates = []
+    for domain, value in clearance_map.items():
+        d = str(domain or "").strip().lower().lstrip(".")
+        if not d or not value:
+            continue
+        # 仅允许：完全一致，或 cookie 域是 host 的父域（.grok.com → www.grok.com）
+        # 不允许 host 反过来匹配到无关父域（x.ai 不能匹配 grok.com）
+        if host == d or host.endswith("." + d):
+            candidates.append((len(d), value))
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def pick_curl_impersonate(user_agent=""):
+    """根据浏览器 UA 选择尽量接近的 TLS 指纹，避免 chrome120 与真实 UA 不匹配。"""
+    ua = str(user_agent or "").lower()
+    # 按版本从高到低匹配
+    version_map = [
+        (136, "chrome136"),
+        (133, "chrome133a"),
+        (131, "chrome131"),
+        (124, "chrome124"),
+        (123, "chrome123"),
+        (120, "chrome120"),
+        (119, "chrome119"),
+        (116, "chrome116"),
+    ]
+    m = re.search(r"chrome/(\d+)", ua)
+    if m:
+        major = int(m.group(1))
+        for threshold, name in version_map:
+            if major >= threshold:
+                return name
+    # 默认用较新的指纹
+    return "chrome136"
+
+
+def browser_fetch_json(url, method="POST", headers=None, json_body=None, binary_body=None, log_callback=None):
+    """在已通过 Cloudflare 的注册浏览器里发同源请求，绕过 curl TLS/cookie 不匹配。
+
+    注意：DrissionPage 的 run_js 不支持 list/bytes 参数，二进制 body 必须走 base64 字符串。
+    """
+    active = refresh_active_page()
+    if active is None:
+        return False, "浏览器页面不可用", None
+
+    headers = dict(headers or {})
+    method = str(method or "POST").upper()
+    # 所有参数都用字符串/基础类型，避免 DrissionPage convert_argument 报 list 不支持
+    headers_json = json.dumps(headers, ensure_ascii=False)
+    if binary_body is not None:
+        body_kind = "binary"
+        body_payload = base64.b64encode(bytes(binary_body)).decode("ascii")
+    elif json_body is not None:
+        body_kind = "json"
+        body_payload = json.dumps(json_body, ensure_ascii=False)
+    else:
+        body_kind = "none"
+        body_payload = ""
+
+    js = r"""
+const url = String(arguments[0] || '');
+const method = String(arguments[1] || 'POST').toUpperCase();
+let headers = {};
+try { headers = JSON.parse(String(arguments[2] || '{}')) || {}; } catch (e) { headers = {}; }
+const bodyKind = String(arguments[3] || 'none');
+const bodyPayload = String(arguments[4] || '');
+function b64ToUint8Array(b64) {
+  const bin = atob(b64 || '');
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+async function run() {
+  try {
+    const init = { method, headers: headers || {}, credentials: 'include' };
+    if (method !== 'GET' && method !== 'HEAD') {
+      if (bodyKind === 'json') {
+        init.body = bodyPayload || '{}';
+        if (!init.headers['content-type'] && !init.headers['Content-Type']) {
+          init.headers['content-type'] = 'application/json';
+        }
+      } else if (bodyKind === 'binary') {
+        // bodyPayload: base64 string
+        init.body = b64ToUint8Array(bodyPayload);
+      }
+    }
+    const res = await fetch(url, init);
+    const buf = await res.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let text = '';
+    try { text = new TextDecoder('utf-8').decode(bytes); } catch (e) { text = ''; }
+    return {
+      ok: res.ok,
+      status: res.status,
+      text: String(text || '').slice(0, 300),
+    };
+  } catch (e) {
+    return { ok: false, status: 0, text: String(e && e.message || e) };
+  }
+}
+return run();
+"""
+    try:
+        result = active.run_js(js, str(url), method, headers_json, body_kind, body_payload, timeout=30)
+        if not isinstance(result, dict):
+            return False, f"浏览器请求返回异常: {result}", None
+        status = int(result.get("status") or 0)
+        text = str(result.get("text") or "")
+        if log_callback:
+            log_callback(f"[Debug] browser_fetch {url} status={status}, body={text[:160]}")
+        if 200 <= status < 300:
+            return True, "ok", result
+        lowered = text.lower()
+        if status in (403, 429, 503) and (
+            "cloudflare" in lowered or "just a moment" in lowered or "__cf_chl" in lowered
+        ):
+            return False, f"浏览器内请求仍被 Cloudflare 拦截 HTTP {status}", result
+        return False, f"浏览器内请求 HTTP {status}: {text[:160]}", result
+    except Exception as exc:
+        return False, f"浏览器内请求异常: {exc}", None
+
+
+def _page_looks_like_cf_challenge(active):
+    title = ""
+    html_head = ""
+    try:
+        title = str(getattr(active, "title", "") or "").lower()
+    except Exception:
+        pass
+    try:
+        html_head = str(getattr(active, "html", "") or "")[:2000].lower()
+    except Exception:
+        pass
+    markers = (
+        "just a moment",
+        "attention required",
+        "__cf_chl",
+        "cf-browser-verification",
+        "challenge-platform",
+        "cdn-cgi/challenge",
+    )
+    blob = f"{title}\n{html_head}"
+    return any(m in blob for m in markers)
+
+
+def ensure_browser_on_host(host, path="/", log_callback=None, timeout=35, require_clearance=True):
+    """确保当前标签页已切到目标站，并尽量等 Cloudflare 挑战通过。
+
+    require_clearance=True 时，会等到出现该 host 的 cf_clearance，或挑战页消失。
+    """
+    active = refresh_active_page()
+    if active is None:
+        return False
+    host = str(host or "").strip().lower()
+    target = f"https://{host}{path}"
+    try:
+        current = str(getattr(active, "url", "") or "")
+        already_there = bool(host and host in current)
+        if not already_there:
+            if log_callback:
+                log_callback(f"[*] 切换浏览器到 {target} 以获取/复用 Cloudflare cookie")
+            active.get(target)
+            try:
+                active.wait.doc_loaded()
+            except Exception:
+                pass
+
+        deadline = time.time() + timeout
+        last_reload = 0.0
+        while time.time() < deadline:
+            active = refresh_active_page()
+            if active is None:
+                time.sleep(0.5)
+                continue
+
+            on_challenge = _page_looks_like_cf_challenge(active)
+            clearance_map, _ = extract_cf_clearance_map(log_callback=None)
+            host_cf = resolve_cf_clearance(clearance_map, host)
+
+            if require_clearance and host_cf and not on_challenge:
+                if log_callback:
+                    log_callback(f"[Debug] {host} Cloudflare 已通过 (cf_clearance=yes)")
+                return True
+            if not require_clearance and not on_challenge:
+                return True
+
+            # 挑战页卡住时偶尔刷新一次
+            now = time.time()
+            if on_challenge and now - last_reload >= 12:
+                if log_callback:
+                    log_callback(f"[*] {host} 仍在 Cloudflare 挑战页，刷新重试...")
+                try:
+                    active.refresh()
+                    active.wait.doc_loaded()
+                except Exception:
+                    try:
+                        active.get(target)
+                    except Exception:
+                        pass
+                last_reload = now
+            time.sleep(0.8)
+
+        # 超时也返回 True，让上层继续尝试（可能已有会话 cookie）
+        if log_callback:
+            clearance_map, _ = extract_cf_clearance_map(log_callback=None)
+            host_cf = resolve_cf_clearance(clearance_map, host)
+            log_callback(
+                f"[Debug] 等待 {host} Cloudflare 超时: cf_clearance={'yes' if host_cf else 'no'}"
+            )
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 切换到 {host} 失败: {exc}")
+        return False
+
+
 def set_birth_date(session, log_callback=None):
     url = "https://grok.com/rest/auth/set-birth-date"
     new_headers = {
+        "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
         "origin": "https://grok.com",
         "referer": "https://grok.com/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     }
     payload = {"birthDate": generate_random_birthdate()}
     try:
-        res = session.post(url, json=payload, headers=new_headers, timeout=15)
+        res = session.post(url, json=payload, headers=new_headers, timeout=20)
         if log_callback:
             log_callback(
                 f"[Debug] set_birth_date status: {res.status_code}, body: {response_preview(res)}"
@@ -1120,14 +1527,18 @@ def set_tos_accepted(session, log_callback=None):
     payload = struct.pack("B", (2 << 3) | 0) + struct.pack("B", 1)
     data = b"\x00" + struct.pack(">I", len(payload)) + payload
     new_headers = {
+        "accept": "*/*",
         "content-type": "application/grpc-web+proto",
         "x-grpc-web": "1",
         "x-user-agent": "connect-es/2.1.1",
         "origin": "https://accounts.x.ai",
         "referer": "https://accounts.x.ai/accept-tos",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     }
     try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
+        res = session.post(url, data=data, headers=new_headers, timeout=20)
         if log_callback:
             log_callback(f"[Debug] set_tos_accepted status: {res.status_code}")
         if 200 <= res.status_code < 300:
@@ -1159,13 +1570,18 @@ def update_nsfw_settings(session, log_callback=None):
     url = "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
     data = encode_grpc_nsfw_settings()
     new_headers = {
+        "accept": "*/*",
         "content-type": "application/grpc-web+proto",
         "x-grpc-web": "1",
+        "x-user-agent": "connect-es/2.1.1",
         "origin": "https://grok.com",
         "referer": "https://grok.com/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     }
     try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
+        res = session.post(url, data=data, headers=new_headers, timeout=20)
         if log_callback:
             log_callback(
                 f"[Debug] update_nsfw status: {res.status_code}, body: {response_preview(res)}"
@@ -1185,33 +1601,311 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
-def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=None):
+def _apply_nsfw_cookies(session, token, clearance_map, extra_cookies=None):
+    """把 sso / cf_clearance 正确挂到对应域名，避免用 Cookie 头串域污染。"""
+    token = str(token or "").strip()
+    # 全局 sso：两个主站都需要
+    if token:
+        session.cookies.set("sso", token, domain=".x.ai")
+        session.cookies.set("sso-rw", token, domain=".x.ai")
+        session.cookies.set("sso", token, domain="accounts.x.ai")
+        session.cookies.set("sso-rw", token, domain="accounts.x.ai")
+        session.cookies.set("sso", token, domain=".grok.com")
+        session.cookies.set("sso-rw", token, domain=".grok.com")
+        session.cookies.set("sso", token, domain="grok.com")
+        session.cookies.set("sso-rw", token, domain="grok.com")
+
+    # 按域设置 cf_clearance
+    for domain, value in (clearance_map or {}).items():
+        d = str(domain or "").strip().lower()
+        v = str(value or "").strip()
+        if not d or not v:
+            continue
+        # curl_cffi cookies 更稳的是不带前导点再补一版
+        bare = d.lstrip(".")
+        try:
+            session.cookies.set("cf_clearance", v, domain=bare)
+        except Exception:
+            pass
+        try:
+            session.cookies.set("cf_clearance", v, domain="." + bare)
+        except Exception:
+            pass
+
+    for item in extra_cookies or []:
+        name = str(item.get("name", "")).strip()
+        value = str(item.get("value", "")).strip()
+        domain = str(item.get("domain", "")).strip().lower().lstrip(".")
+        if not name or not value or name in ("sso", "sso-rw", "cf_clearance"):
+            continue
+        if not domain:
+            continue
+        try:
+            session.cookies.set(name, value, domain=domain)
+        except Exception:
+            pass
+
+
+def enable_nsfw_via_browser(token, log_callback=None):
+    """curl 被 Cloudflare 拦时，改用注册浏览器内 fetch 开启 NSFW。"""
+    if log_callback:
+        log_callback("[*] HTTP 开启 NSFW 被盾拦截，改走浏览器内请求...")
+
+    def _inject_sso(domains, same_site="Lax"):
+        active = refresh_active_page()
+        if active is None or not token:
+            return
+        cookies = []
+        for domain in domains:
+            cookies.extend(
+                [
+                    {"name": "sso", "value": token, "domain": domain, "path": "/"},
+                    {"name": "sso-rw", "value": token, "domain": domain, "path": "/"},
+                ]
+            )
+        try:
+            active.set.cookies(cookies)
+            return
+        except Exception:
+            pass
+        try:
+            for domain in domains:
+                active.run_js(
+                    """
+const token = String(arguments[0] || '');
+const domain = String(arguments[1] || '');
+const sameSite = String(arguments[2] || 'Lax');
+if (!token) return false;
+const base = '; path=/; Secure; SameSite=' + sameSite;
+if (domain) {
+  document.cookie = 'sso=' + token + base + '; domain=' + domain;
+  document.cookie = 'sso-rw=' + token + base + '; domain=' + domain;
+} else {
+  document.cookie = 'sso=' + token + base;
+  document.cookie = 'sso-rw=' + token + base;
+}
+return true;
+                    """,
+                    token,
+                    domain,
+                    same_site,
+                )
+        except Exception:
+            pass
+
+    def _browser_post_with_retry(url, **kwargs):
+        """对 Cloudflare 403 重试：刷新目标站后再发。"""
+        last_msg = ""
+        for attempt in range(1, 4):
+            ok, msg, result = browser_fetch_json(url, **kwargs)
+            if ok:
+                return True, msg
+            last_msg = msg
+            is_cf = "Cloudflare" in str(msg) or "403" in str(msg)
+            if not is_cf:
+                return False, msg
+            if log_callback:
+                log_callback(f"[*] 浏览器请求被盾拦截(第{attempt}/3次): {url}")
+            # 重新过 grok/xai 挑战
+            if "grok.com" in url:
+                ensure_browser_on_host(
+                    "grok.com",
+                    path="/",
+                    log_callback=log_callback,
+                    timeout=40,
+                    require_clearance=True,
+                )
+                _inject_sso([".grok.com", "grok.com"], same_site="Lax")
+            else:
+                ensure_browser_on_host(
+                    "accounts.x.ai",
+                    path="/",
+                    log_callback=log_callback,
+                    timeout=25,
+                    require_clearance=False,
+                )
+                _inject_sso([".x.ai", "accounts.x.ai"], same_site="None")
+            time.sleep(1.2 * attempt)
+        return False, last_msg
+
+    # 1) ToS: accounts.x.ai
+    ensure_browser_on_host(
+        "accounts.x.ai", path="/", log_callback=log_callback, timeout=25, require_clearance=False
+    )
+    _inject_sso([".x.ai", "accounts.x.ai"], same_site="None")
+
+    tos_payload = struct.pack("B", (2 << 3) | 0) + struct.pack("B", 1)
+    tos_data = b"\x00" + struct.pack(">I", len(tos_payload)) + tos_payload
+    ok, msg = _browser_post_with_retry(
+        "https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion",
+        method="POST",
+        headers={
+            "content-type": "application/grpc-web+proto",
+            "x-grpc-web": "1",
+            "x-user-agent": "connect-es/2.1.1",
+            "origin": "https://accounts.x.ai",
+            "referer": "https://accounts.x.ai/accept-tos",
+        },
+        binary_body=tos_data,
+        log_callback=log_callback,
+    )
+    if not ok:
+        return False, f"browser set_tos_accepted 失败: {msg}"
+
+    # 2) birth + nsfw: grok.com —— 必须等 cf_clearance
+    ensure_browser_on_host(
+        "grok.com", path="/", log_callback=log_callback, timeout=45, require_clearance=True
+    )
+    _inject_sso([".grok.com", "grok.com"], same_site="Lax")
+
+    ok, msg = _browser_post_with_retry(
+        "https://grok.com/rest/auth/set-birth-date",
+        method="POST",
+        headers={
+            "content-type": "application/json",
+            "origin": "https://grok.com",
+            "referer": "https://grok.com/",
+        },
+        json_body={"birthDate": generate_random_birthdate()},
+        log_callback=log_callback,
+    )
+    if not ok:
+        return False, f"browser set_birth_date 失败: {msg}"
+
+    nsfw_data = encode_grpc_nsfw_settings()
+    ok, msg = _browser_post_with_retry(
+        "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls",
+        method="POST",
+        headers={
+            "content-type": "application/grpc-web+proto",
+            "x-grpc-web": "1",
+            "x-user-agent": "connect-es/2.1.1",
+            "origin": "https://grok.com",
+            "referer": "https://grok.com/",
+        },
+        binary_body=nsfw_data,
+        log_callback=log_callback,
+    )
+    if not ok:
+        return False, f"browser update_nsfw 失败: {msg}"
+    return True, "成功开启 NSFW（浏览器通道）"
+
+
+def enable_nsfw_for_token(token, cf_clearance="", user_agent="", clearance_map=None, log_callback=None):
     proxies = get_proxies()
     # cf_clearance 与签发它的浏览器 UA 严格绑定，优先用注册浏览器的真实 UA
     ua = user_agent or get_user_agent()
+    impersonate = pick_curl_impersonate(ua)
+
+    # 兼容旧调用：单值 cf_clearance 当作 grok.com
+    if clearance_map is None:
+        clearance_map = {}
+        if cf_clearance:
+            clearance_map["grok.com"] = cf_clearance
+            clearance_map[".grok.com"] = cf_clearance
+
+    # 再从浏览器补一轮最新 cookie（注册刚完成后最有效）
+    browser_cookies = collect_browser_cookies(
+        domains=["grok.com", "accounts.x.ai", "x.ai"], log_callback=log_callback
+    )
+    for item in browser_cookies:
+        if item["name"] == "cf_clearance" and item["domain"]:
+            clearance_map[item["domain"].lstrip(".")] = item["value"]
+            clearance_map[item["domain"]] = item["value"]
+
+    grok_cf = resolve_cf_clearance(clearance_map, "grok.com")
+    xai_cf = resolve_cf_clearance(clearance_map, "accounts.x.ai")
+    if log_callback:
+        log_callback(
+            f"[Debug] NSFW 请求 impersonate={impersonate}, "
+            f"grok_cf={'yes' if grok_cf else 'no'}, xai_cf={'yes' if xai_cf else 'no'}"
+        )
+
+    # 没有 grok.com 自己的 clearance 时，HTTP 通道基本必挂，直接走浏览器
+    if not grok_cf:
+        if log_callback:
+            log_callback("[*] 未拿到 grok.com 的 cf_clearance，跳过 HTTP 通道，直接走浏览器")
+        try:
+            return enable_nsfw_via_browser(token, log_callback=log_callback)
+        except Exception as browser_exc:
+            return False, f"浏览器通道失败: {browser_exc}"
+
+    # HTTP 通道只挂匹配域名的 clearance，禁止把 x.ai 的 clearance 写到 grok.com
+    scoped_map = {}
+    if grok_cf:
+        scoped_map["grok.com"] = grok_cf
+        scoped_map[".grok.com"] = grok_cf
+    if xai_cf:
+        scoped_map["accounts.x.ai"] = xai_cf
+        scoped_map[".x.ai"] = xai_cf
+        scoped_map["x.ai"] = xai_cf
+
+    http_error = ""
     try:
-        with requests.Session(impersonate="chrome120", proxies=proxies) as session:
-            cookie_parts = [f"sso={token}", f"sso-rw={token}"]
-            if cf_clearance:
-                cookie_parts.append(f"cf_clearance={cf_clearance}")
+        with requests.Session(impersonate=impersonate, proxies=proxies) as session:
+            # 不要强行覆盖 curl_cffi 的 UA；只在有真实浏览器 UA 时对齐
             session.headers.update(
                 {
-                    "user-agent": ua,
-                    "cookie": "; ".join(cookie_parts),
+                    "accept-language": "en-US,en;q=0.9",
+                    "cache-control": "no-cache",
+                    "pragma": "no-cache",
                 }
             )
+            if ua:
+                session.headers["user-agent"] = ua
+
+            _apply_nsfw_cookies(session, token, scoped_map, extra_cookies=browser_cookies)
+
+            # 先访问一下主站，让 session 带上更多 cf cookie（若服务端下发）
+            try:
+                session.get(
+                    "https://accounts.x.ai/",
+                    headers={"accept": "text/html,application/xhtml+xml"},
+                    timeout=15,
+                    allow_redirects=True,
+                )
+            except Exception:
+                pass
+            try:
+                session.get(
+                    "https://grok.com/",
+                    headers={"accept": "text/html,application/xhtml+xml"},
+                    timeout=15,
+                    allow_redirects=True,
+                )
+            except Exception:
+                pass
+
             ok, message = set_tos_accepted(session, log_callback)
             if not ok:
-                return False, message
+                http_error = message
+                raise RuntimeError(message)
             ok, message = set_birth_date(session, log_callback)
             if not ok:
-                return False, message
+                http_error = message
+                raise RuntimeError(message)
             ok, message = update_nsfw_settings(session, log_callback)
             if not ok:
-                return False, message
+                http_error = message
+                raise RuntimeError(message)
             return True, "成功开启 NSFW"
     except Exception as e:
-        return False, f"异常: {str(e)}"
+        http_error = http_error or str(e)
+        if log_callback:
+            log_callback(f"[Debug] HTTP 通道开启 NSFW 失败: {http_error}")
+
+    # Cloudflare 拦截时 fallback 到浏览器通道
+    if any(
+        key in str(http_error).lower()
+        for key in ("cloudflare", "403", "429", "503", "防护拦截", "just a moment")
+    ) or not str(http_error):
+        try:
+            return enable_nsfw_via_browser(token, log_callback=log_callback)
+        except Exception as browser_exc:
+            return False, f"HTTP失败: {http_error}; 浏览器通道失败: {browser_exc}"
+
+    return False, http_error
+
 
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
@@ -1400,41 +2094,12 @@ def refresh_active_page():
 
 
 def extract_cf_clearance_and_ua(log_callback=None):
-    """从注册浏览器提取 grok.com 的 cf_clearance 及其绑定的真实 UA。
+    """兼容旧接口：返回 (grok.com 的 cf_clearance, UA)。
 
-    注册流程能拿到 sso 说明浏览器已通过 grok.com 的 Cloudflare 盾，
-    此刻 cf_clearance 就在浏览器 cookie 里，配合真实 UA 可用于后续 NSFW 请求。
-
-    返回:
-      - (cf_clearance str, user_agent str)：任一取不到则为空字符串
+    新逻辑请优先用 extract_cf_clearance_map。
     """
-    cf_clearance = ""
-    user_agent = ""
-    try:
-        active = refresh_active_page()
-        if active is None:
-            return "", ""
-        cookies = active.cookies(all_domains=True, all_info=True) or []
-        for item in cookies:
-            if isinstance(item, dict):
-                name = str(item.get("name", "")).strip()
-                value = str(item.get("value", "")).strip()
-            else:
-                name = str(getattr(item, "name", "")).strip()
-                value = str(getattr(item, "value", "")).strip()
-            if name == "cf_clearance" and value:
-                cf_clearance = value
-                break
-        try:
-            ua = active.run_js("return navigator.userAgent;")
-            if ua:
-                user_agent = str(ua).strip()
-        except Exception:
-            pass
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[Debug] 提取 cf_clearance 失败: {exc}")
-    return cf_clearance, user_agent
+    clearance_map, user_agent = extract_cf_clearance_map(log_callback=log_callback)
+    return resolve_cf_clearance(clearance_map, "grok.com"), user_agent
 
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
@@ -2777,9 +3442,7 @@ class GrokRegisterGUI:
         self.fail_count = 0
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
-        )
+        self.accounts_output_file = os.path.join(get_accounts_dir(), f"accounts_{now}.txt")
         self.update_stats()
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
@@ -2824,7 +3487,7 @@ class GrokRegisterGUI:
                         self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                         try:
                             with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                                os.path.join(get_accounts_dir(), "mail_credentials.txt"),
                                 "a",
                                 encoding="utf-8",
                             ) as f:
@@ -2864,9 +3527,14 @@ class GrokRegisterGUI:
                     )
                     if config.get("enable_nsfw", True):
                         self.log("[*] 6. 开启 NSFW")
-                        cf_clearance, browser_ua = extract_cf_clearance_and_ua(self.log)
+                        # 先访问 grok.com，确保拿到该域 cf_clearance（注册页只在 accounts.x.ai）
+                        ensure_browser_on_host("grok.com", path="/", log_callback=self.log, timeout=45, require_clearance=True)
+                        clearance_map, browser_ua = extract_cf_clearance_map(self.log)
                         nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                            sso, cf_clearance=cf_clearance, user_agent=browser_ua, log_callback=self.log
+                            sso,
+                            user_agent=browser_ua,
+                            clearance_map=clearance_map,
+                            log_callback=self.log,
                         )
                         if nsfw_ok:
                             self.log(f"[+] NSFW 开启成功: {nsfw_msg}")
@@ -2884,6 +3552,9 @@ class GrokRegisterGUI:
                     retry_count_for_slot = 0
                     i += 1
                     self.log(f"[+] 注册成功: {email}")
+                    # device-flow 连续授权容易 rate_limited，账号间隔稍作退避
+                    if i < count:
+                        sleep_with_cancel(5, self.should_stop)
                     if (
                         self.success_count > 0
                         and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
@@ -2983,7 +3654,7 @@ def run_registration_cli(count):
     retry_count_for_slot = 0
     max_slot_retry = 3
     accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
+        get_accounts_dir(),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
@@ -3015,7 +3686,7 @@ def run_registration_cli(count):
                     cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                     try:
                         with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                            os.path.join(get_accounts_dir(), "mail_credentials.txt"),
                             "a",
                             encoding="utf-8",
                         ) as f:
@@ -3055,9 +3726,14 @@ def run_registration_cli(count):
                 )
                 if config.get("enable_nsfw", True):
                     cli_log("[*] 6. 开启 NSFW")
-                    cf_clearance, browser_ua = extract_cf_clearance_and_ua(log_callback=cli_log)
+                    # 先访问 grok.com，确保拿到该域 cf_clearance（注册页只在 accounts.x.ai）
+                    ensure_browser_on_host("grok.com", path="/", log_callback=cli_log, timeout=45, require_clearance=True)
+                    clearance_map, browser_ua = extract_cf_clearance_map(log_callback=cli_log)
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, cf_clearance=cf_clearance, user_agent=browser_ua, log_callback=cli_log
+                        sso,
+                        user_agent=browser_ua,
+                        clearance_map=clearance_map,
+                        log_callback=cli_log,
                     )
                     if nsfw_ok:
                         cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
@@ -3075,6 +3751,9 @@ def run_registration_cli(count):
                 i += 1
                 cli_log(f"[+] 注册成功: {email}")
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
+                # device-flow 连续授权容易 rate_limited，账号间隔稍作退避
+                if i < count:
+                    sleep_with_cancel(5, controller.should_stop)
                 if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
                     cleanup_runtime_memory(
                         log_callback=cli_log,

@@ -1,0 +1,31 @@
+services:
+  grok-register:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: grok-register-cpa:latest
+    container_name: grok-register-cpa
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      RUNNING_IN_DOCKER: "1"
+      BROWSER_HEADLESS: "1"
+      CHROME_PATH: /usr/bin/chromium
+      WEBUI_HOST: "0.0.0.0"
+      WEBUI_PORT: "8787"
+      # 如宿主机代理需容器访问，改为宿主机地址（Mac/Windows 用 host.docker.internal）
+      # HTTP_PROXY: "http://host.docker.internal:7892"
+      # HTTPS_PROXY: "http://host.docker.internal:7892"
+    volumes:
+      - ./data:/data
+    # Linux 访问宿主机代理时取消注释
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/api/health"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 40s

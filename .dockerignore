@@ -1,0 +1,35 @@
+.git
+.claude
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+.idea
+.vscode
+
+# secrets / runtime outputs — never bake into image
+config.json
+config.local.json
+config.local.*
+accounts_*.txt
+mail_credentials.txt
+auth_out/
+auth_out.json
+auth_merged.json
+*.auth.json
+sso_list.txt
+token.json
+*.log
+data/
+DrissionPage/
+autoPortData/
+
+# docs / media not needed at runtime
+assets/
+banner.png
+tests/
+*.md
+LICENSE
